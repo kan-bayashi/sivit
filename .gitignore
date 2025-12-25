@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target/
+debug/
+*.pdb
+
+# Cargo lock (library projects only - keep for binaries)
+# Cargo.lock
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.profraw

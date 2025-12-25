@@ -1,0 +1,13 @@
+[package]
+name = "sivit"
+version = "2025.12.25"
+edition = "2024"
+description = "Simple Image Viewer In Terminal - sxiv-like terminal image viewer"
+
+[dependencies]
+ratatui = { version = "0.29", features = ["crossterm"] }
+ratatui-image = "8.1"
+image = "0.25"
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+base64-simd = "0.8"
