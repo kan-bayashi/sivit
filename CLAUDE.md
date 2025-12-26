@@ -58,6 +58,7 @@ cargo clippy         # Lint
 - `SIVIT_NO_ALT_SCREEN` - Disable alternate screen mode
 - `SIVIT_DEBUG` - Enable debug info in status bar
 - `SIVIT_TRACE_WORKER` - Write worker timing logs to `/tmp/sivit_worker.log`
+- `SIVIT_KGP_NO_COMPRESS` - Disable zlib compression for KGP transmission
 
 ## Coding Conventions
 

@@ -11,3 +11,4 @@ image = "0.25"
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 base64-simd = "0.8"
+flate2 = "1.0"

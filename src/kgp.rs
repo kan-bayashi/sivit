@@ -128,6 +128,10 @@ pub fn erase_rows(area: Rect) -> Vec<Vec<u8>> {
     rows
 }
 
+fn use_zlib_compression() -> bool {
+    std::env::var_os("SIVIT_KGP_NO_COMPRESS").is_none()
+}
+
 pub fn encode_chunks(img: &DynamicImage, id: u32, is_tmux: bool) -> Vec<Vec<u8>> {
     let (w, h) = (img.width(), img.height());
 
@@ -137,7 +141,18 @@ pub fn encode_chunks(img: &DynamicImage, id: u32, is_tmux: bool) -> Vec<Vec<u8>>
         v => (v.clone().into_rgb8().as_raw().clone(), 24),
     };
 
-    let b64 = base64_simd::STANDARD.encode_to_string(&raw).into_bytes();
+    let use_zlib = use_zlib_compression();
+    let data = if use_zlib {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        let _ = encoder.write_all(&raw);
+        encoder.finish().unwrap_or(raw)
+    } else {
+        raw
+    };
+
+    let b64 = base64_simd::STANDARD.encode_to_string(&data).into_bytes();
 
     let mut it = b64.chunks(4096).peekable();
     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(it.len().max(1));
@@ -148,11 +163,13 @@ pub fn encode_chunks(img: &DynamicImage, id: u32, is_tmux: bool) -> Vec<Vec<u8>>
         ("\x1b", "\x1b", "")
     };
 
+    let compression_opt = if use_zlib { ",o=z" } else { "" };
+
     if let Some(first) = it.next() {
         let mut buf = Vec::with_capacity(first.len() + 128);
         _ = write!(
             &mut buf,
-            "{start}_Gq=2,a=T,C=1,U=1,f={format},s={w},v={h},i={id},m={};",
+            "{start}_Gq=2,a=T,C=1,U=1,f={format},s={w},v={h},i={id}{compression_opt},m={};",
             it.peek().is_some() as u8
         );
         buf.extend_from_slice(first);

@@ -1324,6 +1324,7 @@ dependencies = [
  "anyhow",
  "base64-simd",
  "clap",
+ "flate2",
  "image",
  "ratatui",
  "ratatui-image",
