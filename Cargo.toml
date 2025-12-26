@@ -1,6 +1,6 @@
 [package]
 name = "sivit"
-version = "2025.12.25"
+version = "2025.12.26"
 edition = "2024"
 description = "Simple Image Viewer In Terminal - sxiv-like terminal image viewer"
 
