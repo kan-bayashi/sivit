@@ -22,7 +22,8 @@ pub fn delete_all(is_tmux: bool) -> Vec<u8> {
         ("\x1b", "\x1b", "")
     };
 
-    let mut buf = Vec::with_capacity(64);
+    let mut buf = Vec::with_capacity(128);
+    _ = write!(buf, "{start}_Gq=2,a=d,d=a{escape}\\{close}");
     _ = write!(buf, "{start}_Gq=2,a=d,d=A{escape}\\{close}");
     buf
 }
@@ -51,12 +52,6 @@ impl KgpState {
     pub fn invalidate(&mut self) {
         self.last_kgp_id = None;
     }
-
-    /// Update last_area without changing last_kgp_id.
-    /// Called when sending ImagePlace/ImageTransmit to track what area is being placed.
-    pub fn set_last_area(&mut self, area: Rect) {
-        self.last_area = Some(area);
-    }
 }
 
 pub fn place_rows(area: Rect, id: u32) -> Vec<Vec<u8>> {
@@ -65,7 +60,12 @@ pub fn place_rows(area: Rect, id: u32) -> Vec<Vec<u8>> {
     }
 
     let mut rows = Vec::with_capacity(area.height as usize);
-    let (r, g, b) = ((id >> 16) & 0xff, (id >> 8) & 0xff, id & 0xff);
+    let (id_extra, r, g, b) = (
+        (id >> 24) & 0xff,
+        (id >> 16) & 0xff,
+        (id >> 8) & 0xff,
+        id & 0xff,
+    );
 
     for y in 0..area.height {
         let mut buf = Vec::with_capacity(area.width as usize * 4 + 64);
@@ -82,6 +82,11 @@ pub fn place_rows(area: Rect, id: u32) -> Vec<Vec<u8>> {
                 buf,
                 "{}",
                 *DIACRITICS.get(x as usize).unwrap_or(&DIACRITICS[0])
+            );
+            _ = write!(
+                buf,
+                "{}",
+                *DIACRITICS.get(id_extra as usize).unwrap_or(&DIACRITICS[0])
             );
         }
         _ = write!(buf, "\x1b[0m");

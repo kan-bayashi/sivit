@@ -61,6 +61,8 @@ pub struct App {
     pending_display: Option<(Rect, u32)>,
     render_epoch: u64,
     transmit_seq: u64,
+    force_retransmit: bool,
+    clear_after_nav: bool,
 }
 
 pub fn is_tmux_env() -> bool {
@@ -84,8 +86,7 @@ impl App {
 
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
         let render_cache_limit = render_cache_limit();
-
-        Ok(App {
+        let app = App {
             images,
             current_index: 0,
             picker,
@@ -102,23 +103,34 @@ impl App {
             pending_display: None,
             render_epoch: 0,
             transmit_seq: 0,
-        })
+            force_retransmit: false,
+            clear_after_nav: false,
+        };
+
+        // Clear any stale terminal-side image cache at startup.
+        app.writer.send(WriterRequest::ClearAll {
+            area: None,
+            is_tmux: is_tmux_env(),
+        });
+
+        Ok(app)
     }
 
     fn alloc_kgp_id(&mut self) -> u32 {
-        // Kitty "unicode placeholders" encode the image id into the 24-bit RGB foreground color.
-        // Some terminals seem to lose exact RGB values when any component is 0 (e.g. treat 0 as
-        // "default"), which can make a transmitted image unplaceable even though we consider it
-        // "Ready". Very low values also appear prone to quantization, so spread ids across RGB.
+        // Kitty "unicode placeholders" encode the image id into RGB plus an extra diacritic byte.
+        // Some terminals lose exact RGB values when any component is 0 (e.g. treat 0 as "default"),
+        // which can make a transmitted image unplaceable even though we consider it "Ready".
+        // Very low values also appear prone to quantization, so spread ids across RGB.
         //
-        // Generate a scrambled 24-bit id with each component kept away from 0.
+        // Generate a scrambled 32-bit id with each RGB component kept away from 0 so the RGB part
+        // remains distinguishable even under mild quantization.
         const MIN_COMPONENT: u32 = 16;
-        const MUL: u32 = 0x9E3779;
+        const MUL: u32 = 0x9E3779B1;
         loop {
             let idx = self.next_kgp_id;
             self.next_kgp_id = self.next_kgp_id.wrapping_add(1);
 
-            let id = idx.wrapping_mul(MUL) & 0x00FF_FFFF;
+            let id = idx.wrapping_mul(MUL).rotate_left(8);
             let r = (id >> 16) & 0xff;
             let g = (id >> 8) & 0xff;
             let b = id & 0xff;
@@ -286,6 +298,9 @@ impl App {
         if self.in_flight_transmit.is_some() {
             return StatusIndicator::Busy;
         }
+        if self.force_retransmit {
+            return StatusIndicator::Busy;
+        }
 
         let Some(path) = self.current_path() else {
             return StatusIndicator::Busy;
@@ -361,6 +376,8 @@ impl App {
             area: cancel_area,
             epoch: self.render_epoch,
         });
+        self.force_retransmit = true;
+        self.clear_after_nav = true;
 
         // Only invalidate the in-flight entry (not yet fully transmitted).
         // Entries with transmitted=true have already been sent to terminal
@@ -424,7 +441,9 @@ impl App {
                     rendered.last_transmit_seq,
                 )
             };
-            let retransmit = self.should_retransmit_with_seq(transmitted, last_transmit_seq);
+            let force_retransmit = self.force_retransmit;
+            let retransmit =
+                self.should_retransmit_with_seq(transmitted, last_transmit_seq) || force_retransmit;
 
             // Calculate area for placement based on actual image size
             let cells_w = actual_size.0.div_ceil(u32::from(cell_w));
@@ -440,37 +459,15 @@ impl App {
                 cells_h,
             );
 
-            // Check if already transmitted (no need to re-send data, just place)
-            if transmitted && !retransmit {
-                // Navigation/scrolling: do not touch stdout at all (keep status bar snappy).
-                if !allow_transmission {
-                    return;
-                }
-
-                // If nothing changed, avoid re-placing every frame.
-                if self.kgp_state.last_area() == Some(area)
-                    && self.kgp_state.last_kgp_id() == Some(kgp_id)
-                {
-                    return;
-                }
-                if self.pending_display == Some((area, kgp_id)) {
-                    return;
-                }
-
-                self.writer.send(WriterRequest::ImagePlace {
-                    area,
-                    kgp_id,
-                    old_area,
-                    epoch: self.render_epoch,
-                });
-                self.pending_display = Some((area, kgp_id));
-                self.kgp_state.set_last_area(area);
+            // Always transmit to avoid terminal-side cache misses; skip if already displayed
+            // and a refresh is not needed.
+            if self.kgp_state.last_area() == Some(area)
+                && self.kgp_state.last_kgp_id() == Some(kgp_id)
+                && !retransmit
+            {
                 return;
             }
-
-            // Transmit the encoded image (first time for this cached entry)
-            // Skip if transmission is not allowed (user is navigating)
-            if !allow_transmission {
+            if self.pending_display == Some((area, kgp_id)) {
                 return;
             }
 
@@ -479,6 +476,14 @@ impl App {
                 return;
             }
             self.in_flight_transmit = Some(kgp_id);
+            self.force_retransmit = false;
+            if self.clear_after_nav {
+                self.writer.send(WriterRequest::ClearAll {
+                    area: None,
+                    is_tmux,
+                });
+                self.clear_after_nav = false;
+            }
 
             self.writer.send(WriterRequest::ImageTransmit {
                 encoded_chunks,
@@ -488,7 +493,6 @@ impl App {
                 epoch: self.render_epoch,
             });
             self.pending_display = Some((area, kgp_id));
-            self.kgp_state.set_last_area(area);
             return;
         }
 
@@ -579,6 +583,8 @@ mod tests {
             pending_display: None,
             render_epoch: 0,
             transmit_seq: 0,
+            force_retransmit: false,
+            clear_after_nav: false,
         }
     }
 

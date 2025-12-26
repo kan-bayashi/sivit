@@ -41,6 +41,7 @@ pub enum WriterRequest {
         old_area: Option<Rect>,
         epoch: u64,
     },
+    #[allow(dead_code)]
     /// Place a previously transmitted image in the terminal area.
     ImagePlace {
         area: Rect,
@@ -78,6 +79,7 @@ struct Task {
     chunks: VecDeque<Vec<u8>>,
     complete: Option<WriterResultKind>,
     epoch: u64,
+    clears_dirty: bool,
 }
 
 pub struct TerminalWriter {
@@ -122,6 +124,7 @@ impl TerminalWriter {
         let mut current_task: Option<Task> = None;
         let mut current_epoch: u64 = 0;
         let mut should_quit = false;
+        let mut dirty_area: Option<Rect> = None;
         let mut bytes_since_flush: usize = 0;
         const FLUSH_THRESHOLD: usize = 64 * 1024;
 
@@ -141,6 +144,7 @@ impl TerminalWriter {
                         is_tty,
                         &mut out,
                         &mut current_epoch,
+                        &mut dirty_area,
                     ),
                     Err(_) => break,
                 }
@@ -156,6 +160,7 @@ impl TerminalWriter {
                     is_tty,
                     &mut out,
                     &mut current_epoch,
+                    &mut dirty_area,
                 );
                 if should_quit {
                     break;
@@ -185,6 +190,9 @@ impl TerminalWriter {
                             epoch: task.epoch,
                         });
                     }
+                    if task.clears_dirty {
+                        dirty_area = None;
+                    }
                     current_task = None;
                     continue;
                 }
@@ -206,6 +214,9 @@ impl TerminalWriter {
                             epoch: task.epoch,
                         });
                     }
+                    if task.clears_dirty {
+                        dirty_area = None;
+                    }
                     current_task = None;
                 }
             }
@@ -221,6 +232,7 @@ impl TerminalWriter {
         is_tty: bool,
         out: &mut impl Write,
         current_epoch: &mut u64,
+        dirty_area: &mut Option<Rect>,
     ) {
         match msg {
             WriterRequest::Shutdown => {
@@ -237,6 +249,7 @@ impl TerminalWriter {
             WriterRequest::ClearAll { area, is_tmux } => {
                 // Preempt current image work.
                 *current_task = None;
+                *dirty_area = None;
                 if is_tty {
                     let _ = Self::clear_all(out, area, is_tmux);
                     let _ = out.flush();
@@ -251,6 +264,13 @@ impl TerminalWriter {
                 if epoch >= *current_epoch {
                     *current_epoch = epoch;
                     *current_task = None;
+                }
+                if let Some(cancel_area) = area {
+                    let next = match dirty_area.take() {
+                        Some(prev) => union_rect(prev, cancel_area),
+                        None => cancel_area,
+                    };
+                    *dirty_area = Some(next);
                 }
                 if is_tty {
                     // Do not delete ids here: it's racy (the transmit may already have completed)
@@ -280,8 +300,15 @@ impl TerminalWriter {
                     return;
                 }
                 *current_epoch = epoch;
-                *current_task =
-                    Some(Self::task_transmit(encoded_chunks, area, kgp_id, old_area, epoch));
+                let cleanup_area = *dirty_area;
+                *current_task = Some(Self::task_transmit(
+                    encoded_chunks,
+                    area,
+                    kgp_id,
+                    old_area,
+                    cleanup_area,
+                    epoch,
+                ));
             }
             WriterRequest::ImagePlace {
                 area,
@@ -293,22 +320,40 @@ impl TerminalWriter {
                     return;
                 }
                 *current_epoch = epoch;
-                *current_task = Some(Self::task_place(area, kgp_id, old_area, epoch));
+                let cleanup_area = *dirty_area;
+                *current_task = Some(Self::task_place(
+                    area,
+                    kgp_id,
+                    old_area,
+                    cleanup_area,
+                    epoch,
+                ));
             }
         }
     }
 
-    fn task_place(area: Rect, kgp_id: u32, old_area: Option<Rect>, epoch: u64) -> Task {
+    fn task_place(
+        area: Rect,
+        kgp_id: u32,
+        old_area: Option<Rect>,
+        dirty_area: Option<Rect>,
+        epoch: u64,
+    ) -> Task {
         let mut chunks = VecDeque::new();
 
-        // Always erase old_area if provided (even if old == new).
-        // This ensures partial placement data from cancelled tasks is cleaned up.
+        // Step 1: Erase old area FIRST (yazi pattern: hide -> show)
         if let Some(old) = old_area {
             for row in erase_rows(old) {
                 chunks.push_back(row);
             }
         }
+        for cleanup in Self::cleanup_rects(area, None, dirty_area) {
+            for row in erase_rows(cleanup) {
+                chunks.push_back(row);
+            }
+        }
 
+        // Step 2: Place new image
         for row in place_rows(area, kgp_id) {
             chunks.push_back(row);
         }
@@ -317,6 +362,7 @@ impl TerminalWriter {
             chunks,
             complete: Some(WriterResultKind::PlaceDone { kgp_id }),
             epoch,
+            clears_dirty: dirty_area.is_some(),
         }
     }
 
@@ -325,22 +371,30 @@ impl TerminalWriter {
         area: Rect,
         kgp_id: u32,
         old_area: Option<Rect>,
+        dirty_area: Option<Rect>,
         epoch: u64,
     ) -> Task {
         let mut chunks = VecDeque::new();
 
-        // Always erase old_area if provided (even if old == new).
-        // This ensures partial placement data from cancelled tasks is cleaned up.
+        // Step 1: Erase old area FIRST (yazi pattern: hide -> show)
+        // This ensures that even if cancelled mid-execution, the old image is already erased.
         if let Some(old) = old_area {
             for row in erase_rows(old) {
                 chunks.push_back(row);
             }
         }
+        for cleanup in Self::cleanup_rects(area, None, dirty_area) {
+            for row in erase_rows(cleanup) {
+                chunks.push_back(row);
+            }
+        }
 
+        // Step 2: Transmit new image data
         for enc in encoded_chunks {
             chunks.push_back(enc);
         }
 
+        // Step 3: Place new image
         for row in place_rows(area, kgp_id) {
             chunks.push_back(row);
         }
@@ -349,7 +403,23 @@ impl TerminalWriter {
             chunks,
             complete: Some(WriterResultKind::TransmitDone { kgp_id }),
             epoch,
+            clears_dirty: dirty_area.is_some(),
         }
+    }
+
+    fn cleanup_rects(
+        area: Rect,
+        old_area: Option<Rect>,
+        dirty_area: Option<Rect>,
+    ) -> Vec<Rect> {
+        let mut out = Vec::new();
+        if let Some(old) = old_area {
+            out.extend(rect_diff(old, area));
+        }
+        if let Some(dirty) = dirty_area {
+            out.extend(rect_diff(dirty, area));
+        }
+        out
     }
 
     fn clear_all(out: &mut impl Write, area: Option<Rect>, is_tmux: bool) -> std::io::Result<()> {
@@ -412,4 +482,106 @@ fn clip_utf8(s: &str, max_bytes: usize) -> &str {
         end = i;
     }
     &s[..end]
+}
+
+fn rect_diff(old: Rect, new: Rect) -> Vec<Rect> {
+    let mut out = Vec::new();
+    let Some(inter) = rect_intersection(old, new) else {
+        out.push(old);
+        return out;
+    };
+
+    let old_x0 = u32::from(old.x);
+    let old_y0 = u32::from(old.y);
+    let old_x1 = old_x0 + u32::from(old.width);
+    let old_y1 = old_y0 + u32::from(old.height);
+    let inter_x0 = u32::from(inter.x);
+    let inter_y0 = u32::from(inter.y);
+    let inter_x1 = inter_x0 + u32::from(inter.width);
+    let inter_y1 = inter_y0 + u32::from(inter.height);
+
+    if old_y0 < inter_y0 {
+        out.push(Rect::new(
+            old.x,
+            old.y,
+            old.width,
+            (inter_y0 - old_y0) as u16,
+        ));
+    }
+    if inter_y1 < old_y1 {
+        out.push(Rect::new(
+            old.x,
+            inter_y1 as u16,
+            old.width,
+            (old_y1 - inter_y1) as u16,
+        ));
+    }
+    if old_x0 < inter_x0 {
+        out.push(Rect::new(
+            old.x,
+            inter.y,
+            (inter_x0 - old_x0) as u16,
+            inter.height,
+        ));
+    }
+    if inter_x1 < old_x1 {
+        out.push(Rect::new(
+            inter_x1 as u16,
+            inter.y,
+            (old_x1 - inter_x1) as u16,
+            inter.height,
+        ));
+    }
+
+    out
+}
+
+fn rect_intersection(a: Rect, b: Rect) -> Option<Rect> {
+    let ax0 = u32::from(a.x);
+    let ay0 = u32::from(a.y);
+    let ax1 = ax0 + u32::from(a.width);
+    let ay1 = ay0 + u32::from(a.height);
+    let bx0 = u32::from(b.x);
+    let by0 = u32::from(b.y);
+    let bx1 = bx0 + u32::from(b.width);
+    let by1 = by0 + u32::from(b.height);
+
+    let x0 = ax0.max(bx0);
+    let y0 = ay0.max(by0);
+    let x1 = ax1.min(bx1);
+    let y1 = ay1.min(by1);
+
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+
+    Some(Rect::new(
+        x0 as u16,
+        y0 as u16,
+        (x1 - x0) as u16,
+        (y1 - y0) as u16,
+    ))
+}
+
+fn union_rect(a: Rect, b: Rect) -> Rect {
+    let ax0 = u32::from(a.x);
+    let ay0 = u32::from(a.y);
+    let ax1 = ax0 + u32::from(a.width);
+    let ay1 = ay0 + u32::from(a.height);
+    let bx0 = u32::from(b.x);
+    let by0 = u32::from(b.y);
+    let bx1 = bx0 + u32::from(b.width);
+    let by1 = by0 + u32::from(b.height);
+
+    let x0 = ax0.min(bx0);
+    let y0 = ay0.min(by0);
+    let x1 = ax1.max(bx1);
+    let y1 = ay1.max(by1);
+
+    Rect::new(
+        x0 as u16,
+        y0 as u16,
+        (x1 - x0) as u16,
+        (y1 - y0) as u16,
+    )
 }
