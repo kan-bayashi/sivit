@@ -897,14 +897,20 @@ impl App {
                 let tiles_per_page = cols * rows;
                 let page_start = (self.tile_cursor / tiles_per_page) * tiles_per_page;
                 let page_end = (page_start + tiles_per_page).min(self.images.len());
+                let selected_name = self
+                    .images
+                    .get(self.tile_cursor)
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
                 format!(
-                    "[{}-{}/{}] {} {}x{} Grid",
+                    "[{}-{}/{}] {} {} {}",
                     page_start + 1,
                     page_end,
                     self.images.len(),
                     SEP,
-                    cols,
-                    rows
+                    ICON_IMAGE,
+                    selected_name
                 )
             }
         }
