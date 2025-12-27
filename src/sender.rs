@@ -24,6 +24,8 @@ use crate::kgp::{delete_all, delete_by_id, erase_rows, place_rows};
 pub enum StatusIndicator {
     Busy,
     Ready,
+    Fit,
+    Tile,
 }
 
 pub enum WriterRequest {
@@ -56,6 +58,14 @@ pub enum WriterRequest {
     CopyToClipboard {
         data: Vec<u8>,
         is_tmux: bool,
+    },
+    /// Draw tile cursor border (ANSI overlay).
+    TileCursor {
+        grid: (usize, usize),
+        cursor_idx: usize,
+        image_area: Rect,
+        prev_cursor_idx: Option<usize>,
+        cell_size: (u16, u16),
     },
     Shutdown,
 }
@@ -280,6 +290,29 @@ impl TerminalWriter {
                     let _ = out.flush();
                 }
             }
+            WriterRequest::TileCursor {
+                grid,
+                cursor_idx,
+                image_area,
+                prev_cursor_idx,
+                cell_size,
+            } => {
+                if is_tty {
+                    // Clear previous cursor if different
+                    if let Some(prev_idx) = prev_cursor_idx
+                        && prev_idx != cursor_idx
+                    {
+                        let _ = out.write_all(&Self::build_tile_cursor_escape(
+                            grid, prev_idx, image_area, cell_size, false, // clear
+                        ));
+                    }
+                    // Draw new cursor
+                    let _ = out.write_all(&Self::build_tile_cursor_escape(
+                        grid, cursor_idx, image_area, cell_size, true, // draw
+                    ));
+                    let _ = out.flush();
+                }
+            }
         }
     }
 
@@ -361,6 +394,8 @@ impl TerminalWriter {
         // Nerdfont icons and Powerline separator
         const ICON_READY: &str = "\u{f012c}"; //  (nf-md-check)
         const ICON_BUSY: &str = "\u{f110}"; //  (nf-fa-spinner)
+        const ICON_FIT: &str = "\u{f004c}"; //  (nf-md-arrow_expand_all)
+        const ICON_TILE: &str = "\u{f11d9}"; //  (nf-md-view_grid_outline)
         const SEP: &str = "\u{e0b0}"; //  (Powerline separator)
 
         // ANSI 16-color (uses terminal theme colors)
@@ -371,6 +406,8 @@ impl TerminalWriter {
         const BG_MAIN: u8 = 40; // Black
         const BG_READY: u8 = 42; // Green
         const BG_BUSY: u8 = 43; // Yellow
+        const BG_FIT: u8 = 45; // Magenta
+        const BG_TILE: u8 = 46; // Cyan
 
         let row_1based = h;
         // Reserve 4 columns for icon segment " X  " (icon + spaces + separator)
@@ -380,6 +417,8 @@ impl TerminalWriter {
         let (icon, fg_indicator, bg_indicator) = match indicator {
             StatusIndicator::Ready => (ICON_READY, BG_READY - 10, BG_READY), // fg=32 (Green)
             StatusIndicator::Busy => (ICON_BUSY, BG_BUSY - 10, BG_BUSY),     // fg=33 (Yellow)
+            StatusIndicator::Fit => (ICON_FIT, BG_FIT - 10, BG_FIT),         // fg=35 (Magenta)
+            StatusIndicator::Tile => (ICON_TILE, BG_TILE - 10, BG_TILE),     // fg=36 (Cyan)
         };
 
         // Clear line with main background
@@ -398,6 +437,101 @@ impl TerminalWriter {
         write!(out, "\x1b[{FG_LIGHT};{BG_MAIN}m {clipped}\x1b[0m")?;
 
         Ok(())
+    }
+
+    /// Build ANSI escape sequence to draw or clear tile cursor border.
+    fn build_tile_cursor_escape(
+        grid: (usize, usize),
+        cursor_idx: usize,
+        image_area: Rect,
+        cell_size: (u16, u16),
+        draw: bool,
+    ) -> Vec<u8> {
+        use std::fmt::Write;
+
+        let (cols, rows) = grid;
+        if cols == 0 || rows == 0 || cursor_idx >= cols * rows {
+            return Vec::new();
+        }
+
+        let (cell_w, cell_h) = cell_size;
+        if cell_w == 0 || cell_h == 0 {
+            return Vec::new();
+        }
+
+        // Use cell-aligned tile boundaries (matching worker.rs)
+        // This ensures cursor position matches the actual tile positions in the image
+        let canvas_w_cells = u32::from(image_area.width);
+        let canvas_h_cells = u32::from(image_area.height);
+
+        let col = cursor_idx % cols;
+        let row = cursor_idx / cols;
+
+        // Calculate tile boundaries in cells (same formula as worker.rs)
+        let tile_x_cells = (col as u32 * canvas_w_cells) / cols as u32;
+        let tile_y_cells = (row as u32 * canvas_h_cells) / rows as u32;
+        let next_tile_x_cells = ((col + 1) as u32 * canvas_w_cells) / cols as u32;
+        let next_tile_y_cells = ((row + 1) as u32 * canvas_h_cells) / rows as u32;
+
+        let tile_x = image_area.x + tile_x_cells as u16;
+        let tile_y = image_area.y + tile_y_cells as u16;
+        let tile_x_end = image_area.x + next_tile_x_cells as u16;
+        let tile_y_end = image_area.y + next_tile_y_cells as u16;
+
+        // Unicode box drawing characters (rounded corners)
+        const TOP_LEFT: char = '╭';
+        const TOP_RIGHT: char = '╮';
+        const BOTTOM_LEFT: char = '╰';
+        const BOTTOM_RIGHT: char = '╯';
+        const HORIZONTAL: char = '─';
+        const VERTICAL: char = '│';
+
+        // Pre-allocate buffer (estimate: ~20 bytes per cell)
+        let estimated_size = ((tile_x_end - tile_x) + (tile_y_end - tile_y)) as usize * 20;
+        let mut s = String::with_capacity(estimated_size);
+
+        if draw {
+            s.push_str("\x1b[36m"); // Cyan color
+        } else {
+            s.push_str("\x1b[0m"); // Reset color
+        }
+
+        let char_h = if draw { HORIZONTAL } else { ' ' };
+        let char_v = if draw { VERTICAL } else { ' ' };
+        let char_tl = if draw { TOP_LEFT } else { ' ' };
+        let char_tr = if draw { TOP_RIGHT } else { ' ' };
+        let char_bl = if draw { BOTTOM_LEFT } else { ' ' };
+        let char_br = if draw { BOTTOM_RIGHT } else { ' ' };
+
+        // Top edge: move to position, draw corner + horizontal line + corner
+        let top_row = tile_y + 1; // 1-based
+        let left_col = tile_x + 1; // 1-based
+        let right_col = tile_x_end; // 1-based
+
+        // Draw top edge
+        let _ = write!(s, "\x1b[{};{}H{}", top_row, left_col, char_tl);
+        for c in (left_col + 1)..right_col {
+            let _ = write!(s, "\x1b[{};{}H{}", top_row, c, char_h);
+        }
+        let _ = write!(s, "\x1b[{};{}H{}", top_row, right_col, char_tr);
+
+        // Bottom edge
+        let bottom_row = tile_y_end;
+        let _ = write!(s, "\x1b[{};{}H{}", bottom_row, left_col, char_bl);
+        for c in (left_col + 1)..right_col {
+            let _ = write!(s, "\x1b[{};{}H{}", bottom_row, c, char_h);
+        }
+        let _ = write!(s, "\x1b[{};{}H{}", bottom_row, right_col, char_br);
+
+        // Left and right edges (vertical lines)
+        for r in (top_row + 1)..bottom_row {
+            let _ = write!(s, "\x1b[{};{}H{}", r, left_col, char_v);
+            let _ = write!(s, "\x1b[{};{}H{}", r, right_col, char_v);
+        }
+
+        s.push_str("\x1b[0m"); // Reset attributes
+
+        s.into_bytes()
     }
 }
 

@@ -1,10 +1,11 @@
 // Copyright 2025 Tomoki Hayashi
 // MIT License (https://opensource.org/licenses/MIT)
 
-//! Fit mode selection for resizing.
+//! Fit mode and view mode selection.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FitMode {
+    #[default]
     Normal,
     Fit,
 }
@@ -17,4 +18,11 @@ impl FitMode {
             FitMode::Fit => FitMode::Normal,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    #[default]
+    Single,
+    Tile,
 }

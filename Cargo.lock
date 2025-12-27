@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "svt"
-version = "25.12.3"
+version = "25.12.4"
 dependencies = [
  "anyhow",
  "arboard",

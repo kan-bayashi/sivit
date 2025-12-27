@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 
 use image::DynamicImage;
 
-use crate::fit::FitMode;
+use crate::fit::{FitMode, ViewMode};
 use crate::kgp::encode_chunks;
 
 pub struct ImageRequest {
@@ -28,6 +28,11 @@ pub struct ImageRequest {
     pub compress_level: Option<u32>,
     pub tmux_kitty_max_pixels: u64,
     pub trace_worker: bool,
+    // Tile mode fields
+    pub view_mode: ViewMode,
+    pub tile_paths: Option<Vec<PathBuf>>,
+    pub tile_grid: Option<(usize, usize)>,
+    pub cell_size: Option<(u16, u16)>, // (width, height) in pixels for padding calculation
 }
 
 pub struct ImageResult {
@@ -89,111 +94,177 @@ impl ImageWorker {
             // Drain any pending requests, keep only the latest
             let req = Self::drain_to_latest(&request_rx, req);
 
-            // Decode (with cache)
-            let decode_start = std::time::Instant::now();
-            let decoded = if let Some((ref cached_path, ref img)) = cache {
-                if cached_path == &req.path {
-                    img.clone()
-                } else {
-                    match Self::decode_image(&req.path) {
-                        Some(img) => {
-                            cache = Some((req.path.clone(), img.clone()));
-                            img
-                        }
-                        None => continue,
-                    }
+            match req.view_mode {
+                ViewMode::Single => {
+                    Self::process_single_request(
+                        &req,
+                        &mut cache,
+                        &mut pending,
+                        &request_rx,
+                        &result_tx,
+                    );
                 }
+                ViewMode::Tile => {
+                    Self::process_tile_request(&req, &mut pending, &request_rx, &result_tx);
+                }
+            }
+        }
+    }
+
+    fn process_single_request(
+        req: &ImageRequest,
+        cache: &mut Option<(PathBuf, DynamicImage)>,
+        pending: &mut Option<ImageRequest>,
+        request_rx: &Receiver<ImageRequest>,
+        result_tx: &Sender<ImageResult>,
+    ) {
+        // Decode (with cache)
+        let decode_start = std::time::Instant::now();
+        let decoded = if let Some((cached_path, img)) = cache.as_ref() {
+            if cached_path == &req.path {
+                img.clone()
             } else {
                 match Self::decode_image(&req.path) {
                     Some(img) => {
-                        cache = Some((req.path.clone(), img.clone()));
+                        *cache = Some((req.path.clone(), img.clone()));
                         img
                     }
-                    None => continue,
-                }
-            };
-            let decode_elapsed = decode_start.elapsed();
-
-            // Check for newer request after decode (most expensive step)
-            if let Ok(newer) = request_rx.try_recv() {
-                pending = Some(Self::drain_to_latest(&request_rx, newer));
-                continue; // Abandon current work
-            }
-
-            let (orig_w, orig_h) = (decoded.width(), decoded.height());
-            let (max_w, max_h) = req.target;
-            let (mut target_w, mut target_h) =
-                Self::compute_target((orig_w, orig_h), (max_w, max_h), req.fit_mode);
-
-            // Apply max pixels limit (for tmux+kitty compatibility).
-            // In `Fit` mode we allow larger images (may be slower / unsupported in some setups).
-            if req.fit_mode != FitMode::Fit {
-                let max_pixels = req.tmux_kitty_max_pixels;
-                let target_pixels = (target_w as u64).saturating_mul(target_h as u64);
-                if target_pixels > max_pixels {
-                    let down = (max_pixels as f64 / target_pixels as f64).sqrt();
-                    target_w = (target_w as f64 * down).floor().max(1.0) as u32;
-                    target_h = (target_h as f64 * down).floor().max(1.0) as u32;
+                    None => return,
                 }
             }
-
-            // Resize
-            let resize_start = std::time::Instant::now();
-            let resized = if target_w != orig_w || target_h != orig_h {
-                decoded.thumbnail(target_w, target_h)
-            } else {
-                decoded
-            };
-            let actual_size = (resized.width(), resized.height());
-            let resize_elapsed = resize_start.elapsed();
-
-            // Check for newer request after resize
-            if let Ok(newer) = request_rx.try_recv() {
-                pending = Some(Self::drain_to_latest(&request_rx, newer));
-                continue;
-            }
-
-            // Encode
-            let encode_start = std::time::Instant::now();
-            let encoded_chunks =
-                encode_chunks(&resized, req.kgp_id, req.is_tmux, req.compress_level);
-            let encode_elapsed = encode_start.elapsed();
-
-            if req.trace_worker {
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/svt_worker.log")
-                {
-                    let _ = writeln!(
-                        f,
-                        "kgp_id={} path={:?} decode={:?} resize={:?} encode={:?} orig=({},{}) target=({},{}) actual=({},{})",
-                        req.kgp_id,
-                        req.path,
-                        decode_elapsed,
-                        resize_elapsed,
-                        encode_elapsed,
-                        orig_w,
-                        orig_h,
-                        max_w,
-                        max_h,
-                        actual_size.0,
-                        actual_size.1
-                    );
+        } else {
+            match Self::decode_image(&req.path) {
+                Some(img) => {
+                    *cache = Some((req.path.clone(), img.clone()));
+                    img
                 }
+                None => return,
             }
+        };
+        let decode_elapsed = decode_start.elapsed();
 
-            // Send result
-            let _ = result_tx.send(ImageResult {
-                path: req.path,
-                target: req.target,
-                fit_mode: req.fit_mode,
-                original_size: (orig_w, orig_h),
-                actual_size,
-                encoded_chunks,
-            });
+        // Check for newer request after decode (most expensive step)
+        if let Ok(newer) = request_rx.try_recv() {
+            *pending = Some(Self::drain_to_latest(request_rx, newer));
+            return; // Abandon current work
         }
+
+        let (orig_w, orig_h) = (decoded.width(), decoded.height());
+        let (max_w, max_h) = req.target;
+        let (mut target_w, mut target_h) =
+            Self::compute_target((orig_w, orig_h), (max_w, max_h), req.fit_mode);
+
+        // Apply max pixels limit (for tmux+kitty compatibility).
+        // In `Fit` mode we allow larger images (may be slower / unsupported in some setups).
+        if req.fit_mode != FitMode::Fit {
+            let max_pixels = req.tmux_kitty_max_pixels;
+            let target_pixels = (target_w as u64).saturating_mul(target_h as u64);
+            if target_pixels > max_pixels {
+                let down = (max_pixels as f64 / target_pixels as f64).sqrt();
+                target_w = (target_w as f64 * down).floor().max(1.0) as u32;
+                target_h = (target_h as f64 * down).floor().max(1.0) as u32;
+            }
+        }
+
+        // Resize
+        let resize_start = std::time::Instant::now();
+        let resized = if target_w != orig_w || target_h != orig_h {
+            decoded.thumbnail(target_w, target_h)
+        } else {
+            decoded
+        };
+        let actual_size = (resized.width(), resized.height());
+        let resize_elapsed = resize_start.elapsed();
+
+        // Check for newer request after resize
+        if let Ok(newer) = request_rx.try_recv() {
+            *pending = Some(Self::drain_to_latest(request_rx, newer));
+            return;
+        }
+
+        // Encode
+        let encode_start = std::time::Instant::now();
+        let encoded_chunks = encode_chunks(&resized, req.kgp_id, req.is_tmux, req.compress_level);
+        let encode_elapsed = encode_start.elapsed();
+
+        if req.trace_worker {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/svt_worker.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "kgp_id={} path={:?} decode={:?} resize={:?} encode={:?} orig=({},{}) target=({},{}) actual=({},{})",
+                    req.kgp_id,
+                    req.path,
+                    decode_elapsed,
+                    resize_elapsed,
+                    encode_elapsed,
+                    orig_w,
+                    orig_h,
+                    max_w,
+                    max_h,
+                    actual_size.0,
+                    actual_size.1
+                );
+            }
+        }
+
+        // Send result
+        let _ = result_tx.send(ImageResult {
+            path: req.path.clone(),
+            target: req.target,
+            fit_mode: req.fit_mode,
+            original_size: (orig_w, orig_h),
+            actual_size,
+            encoded_chunks,
+        });
+    }
+
+    fn process_tile_request(
+        req: &ImageRequest,
+        pending: &mut Option<ImageRequest>,
+        request_rx: &Receiver<ImageRequest>,
+        result_tx: &Sender<ImageResult>,
+    ) {
+        let Some(ref tile_paths) = req.tile_paths else {
+            return;
+        };
+        let Some(grid) = req.tile_grid else {
+            return;
+        };
+
+        // Composite tile images (cursor is drawn separately via ANSI)
+        let Some((composite, actual_size)) = Self::composite_tile_images(
+            tile_paths,
+            grid,
+            req.target,
+            req.cell_size,
+            req.trace_worker,
+        ) else {
+            return;
+        };
+
+        // Check for newer request
+        if let Ok(newer) = request_rx.try_recv() {
+            *pending = Some(Self::drain_to_latest(request_rx, newer));
+            return;
+        }
+
+        // Encode
+        let encoded_chunks = encode_chunks(&composite, req.kgp_id, req.is_tmux, req.compress_level);
+
+        // Send result
+        let _ = result_tx.send(ImageResult {
+            path: req.path.clone(),
+            target: req.target,
+            fit_mode: req.fit_mode,
+            original_size: actual_size,
+            actual_size,
+            encoded_chunks,
+        });
     }
 
     fn compute_target(orig: (u32, u32), max: (u32, u32), fit_mode: FitMode) -> (u32, u32) {
@@ -228,8 +299,113 @@ impl ImageWorker {
         }
     }
 
-    fn decode_image(path: &PathBuf) -> Option<DynamicImage> {
+    fn decode_image(path: &std::path::Path) -> Option<DynamicImage> {
         image::ImageReader::open(path).ok()?.decode().ok()
+    }
+
+    /// Composite multiple images into a single tile grid image (without cursor).
+    fn composite_tile_images(
+        paths: &[PathBuf],
+        grid: (usize, usize),
+        canvas_size: (u32, u32),
+        cell_size: Option<(u16, u16)>,
+        trace_worker: bool,
+    ) -> Option<(DynamicImage, (u32, u32))> {
+        use image::{GenericImage, Rgba, RgbaImage};
+
+        let (cols, rows) = grid;
+        let (canvas_w, canvas_h) = canvas_size;
+
+        // Get cell dimensions for alignment
+        let (cell_w, cell_h) = cell_size.unwrap_or((8, 16));
+        let cell_w = u32::from(cell_w);
+        let cell_h = u32::from(cell_h);
+
+        // Calculate canvas size in cells (for cell-aligned tile boundaries)
+        let canvas_w_cells = canvas_w / cell_w;
+        let canvas_h_cells = canvas_h / cell_h;
+
+        // Padding around each thumbnail (leaves space for cursor border).
+        // Cursor is 1 cell wide, so padding needs to be at least 1 cell in each direction.
+        // Use separate padding for horizontal and vertical to handle non-square cells.
+        let half_pad_w = cell_w; // 1 cell width for each side
+        let half_pad_h = cell_h; // 1 cell height for each side
+
+        // Create canvas with transparent background
+        let mut canvas = RgbaImage::from_pixel(canvas_w, canvas_h, Rgba([0, 0, 0, 0]));
+
+        for (i, path) in paths.iter().enumerate() {
+            if i >= cols * rows {
+                break;
+            }
+
+            let col = i % cols;
+            let row = i / cols;
+
+            // Calculate tile boundaries aligned to cell boundaries
+            // This ensures cursor (drawn in cell units) matches tile positions
+            let tile_x_cells = (col as u32 * canvas_w_cells) / cols as u32;
+            let tile_y_cells = (row as u32 * canvas_h_cells) / rows as u32;
+            let next_tile_x_cells = ((col + 1) as u32 * canvas_w_cells) / cols as u32;
+            let next_tile_y_cells = ((row + 1) as u32 * canvas_h_cells) / rows as u32;
+
+            // Convert to pixels
+            let tile_x = tile_x_cells * cell_w;
+            let tile_y = tile_y_cells * cell_h;
+            let tile_w = (next_tile_x_cells - tile_x_cells) * cell_w;
+            let tile_h = (next_tile_y_cells - tile_y_cells) * cell_h;
+
+            // Calculate inner size for this specific tile (with padding for cursor border)
+            let inner_w = tile_w.saturating_sub(half_pad_w * 2);
+            let inner_h = tile_h.saturating_sub(half_pad_h * 2);
+
+            if inner_w == 0 || inner_h == 0 {
+                continue;
+            }
+
+            // Decode and resize image to fit tile (with padding)
+            let img = match Self::decode_image(path) {
+                Some(img) => img,
+                None => {
+                    // Log decode failure if tracing is enabled
+                    if trace_worker {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/svt_worker.log")
+                        {
+                            let _ = writeln!(f, "tile decode failed: {:?}", path);
+                        }
+                    }
+                    continue; // Skip failed images instead of returning None
+                }
+            };
+            let (orig_w, orig_h) = (img.width(), img.height());
+
+            // Calculate scaled size to fit within inner area while preserving aspect ratio
+            let scale_w = inner_w as f64 / orig_w as f64;
+            let scale_h = inner_h as f64 / orig_h as f64;
+            let scale = scale_w.min(scale_h).min(1.0); // Don't upscale
+
+            let scaled_w = (orig_w as f64 * scale).floor().max(1.0) as u32;
+            let scaled_h = (orig_h as f64 * scale).floor().max(1.0) as u32;
+
+            let thumbnail = img.thumbnail(scaled_w, scaled_h);
+            let rgba_thumb = thumbnail.to_rgba8();
+
+            // Calculate position to center image in tile cell (with padding)
+            let img_x = tile_x + half_pad_w + (inner_w.saturating_sub(scaled_w)) / 2;
+            let img_y = tile_y + half_pad_h + (inner_h.saturating_sub(scaled_h)) / 2;
+
+            // Copy thumbnail to canvas
+            if img_x + scaled_w <= canvas_w && img_y + scaled_h <= canvas_h {
+                let _ = canvas.copy_from(&rgba_thumb, img_x, img_y);
+            }
+        }
+
+        let actual_size = (canvas_w, canvas_h);
+        Some((DynamicImage::ImageRgba8(canvas), actual_size))
     }
 
     pub fn request(&self, req: ImageRequest) {
