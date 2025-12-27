@@ -22,10 +22,11 @@ svt の高速化余地を調査した結果をまとめる。
 | HashMap キャッシュ | `render_cache` を HashMap + VecDeque (LRU) に変更 | app.rs |
 | Tile 合成の並列化 | rayon で並列デコード・リサイズ | worker.rs |
 | Resize フィルタ設定 | Single: `resize_filter` (default: Triangle), Tile: `tile_filter` (default: Nearest) | worker.rs, config.rs |
+| Tile サムネイルキャッシュ | LRU キャッシュ (500 エントリ) でサムネイル再利用 | worker.rs |
 
 ---
 
-## 未実装: 中〜高インパクト
+## 保留: 効果限定的
 
 ### 3. as_raw().clone() の削減
 
@@ -42,24 +43,6 @@ svt の高速化余地を調査した結果をまとめる。
 **効果:** メモリ削減
 **複雑度:** 中
 **状態:** 保留（実装複雑で効果限定的）
-
----
-
-### 4. Tile サムネイルキャッシュ
-
-**現状の問題:**
-- ページ移動毎に全タイルを再デコード・リサイズ
-- 同じ画像が異なるページで再処理される
-
-**改善案:**
-```rust
-// worker.rs に追加
-type ThumbnailCache = LruCache<(PathBuf, u32, u32), Arc<RgbaImage>>;
-```
-
-**効果:** Tile モードの体感改善
-**複雑度:** 中
-**状態:** 未実装
 
 ---
 
@@ -116,10 +99,10 @@ base64_simd::STANDARD.encode_to_vec(&data)
 2. #2 encoded_chunks Arc 化
 3. #5 HashMap キャッシュ
 4. #6 Tile 合成の並列化 (rayon)
-5. #7 Tile 高速フィルタ
+5. #7 Tile 高速フィルタ (+ Single モード対応)
+6. #4 Tile サムネイルキャッシュ
 
 ### 次のステップ
-6. #4 Tile サムネイルキャッシュ (中インパクト)
 7. #8, #9, #10 の小改善
 
 ### 保留

@@ -10,15 +10,60 @@
 //!
 //! Requests are best-effort; newer requests may preempt older ones.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use image::DynamicImage;
+use image::{DynamicImage, RgbaImage};
 
 use crate::fit::{FitMode, ViewMode};
 use crate::kgp::encode_chunks;
+
+/// Cache key for tile thumbnails: (path, width, height)
+type ThumbnailKey = (PathBuf, u32, u32);
+
+/// LRU cache for tile thumbnails
+struct ThumbnailCache {
+    cache: HashMap<ThumbnailKey, Arc<RgbaImage>>,
+    order: VecDeque<ThumbnailKey>,
+    capacity: usize,
+}
+
+impl ThumbnailCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, key: &ThumbnailKey) -> Option<Arc<RgbaImage>> {
+        if let Some(img) = self.cache.get(key) {
+            // Move to back (most recently used)
+            self.order.retain(|k| k != key);
+            self.order.push_back(key.clone());
+            Some(Arc::clone(img))
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: ThumbnailKey, img: Arc<RgbaImage>) {
+        if self.cache.contains_key(&key) {
+            self.order.retain(|k| k != &key);
+        } else if self.cache.len() >= self.capacity {
+            // Evict oldest
+            if let Some(oldest) = self.order.pop_front() {
+                self.cache.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.cache.insert(key, img);
+    }
+}
 
 pub struct ImageRequest {
     pub path: PathBuf,
@@ -82,6 +127,7 @@ impl ImageWorker {
 
     fn worker_loop(request_rx: Receiver<ImageRequest>, result_tx: Sender<ImageResult>) {
         let mut cache: Option<(PathBuf, Arc<DynamicImage>)> = None;
+        let mut thumbnail_cache = ThumbnailCache::new(500); // Cache up to 500 thumbnails
         let mut pending: Option<ImageRequest> = None;
 
         loop {
@@ -109,7 +155,13 @@ impl ImageWorker {
                     );
                 }
                 ViewMode::Tile => {
-                    Self::process_tile_request(&req, &mut pending, &request_rx, &result_tx);
+                    Self::process_tile_request(
+                        &req,
+                        &mut thumbnail_cache,
+                        &mut pending,
+                        &request_rx,
+                        &result_tx,
+                    );
                 }
             }
         }
@@ -232,6 +284,7 @@ impl ImageWorker {
 
     fn process_tile_request(
         req: &ImageRequest,
+        thumbnail_cache: &mut ThumbnailCache,
         pending: &mut Option<ImageRequest>,
         request_rx: &Receiver<ImageRequest>,
         result_tx: &Sender<ImageResult>,
@@ -250,6 +303,7 @@ impl ImageWorker {
             req.target,
             req.cell_size,
             req.tile_filter,
+            thumbnail_cache,
             req.trace_worker,
         ) else {
             return;
@@ -312,16 +366,17 @@ impl ImageWorker {
     }
 
     /// Composite multiple images into a single tile grid image (without cursor).
-    /// Uses parallel processing for decode and resize operations.
+    /// Uses thumbnail cache and parallel processing for decode/resize operations.
     fn composite_tile_images(
         paths: &[PathBuf],
         grid: (usize, usize),
         canvas_size: (u32, u32),
         cell_size: Option<(u16, u16)>,
         filter: image::imageops::FilterType,
+        thumbnail_cache: &mut ThumbnailCache,
         trace_worker: bool,
     ) -> Option<(DynamicImage, (u32, u32))> {
-        use image::{GenericImage, Rgba, RgbaImage};
+        use image::{GenericImage, Rgba};
         use rayon::prelude::*;
 
         let (cols, rows) = grid;
@@ -337,45 +392,69 @@ impl ImageWorker {
         let canvas_h_cells = canvas_h / cell_h;
 
         // Padding around each thumbnail (leaves space for cursor border).
-        // Cursor is 1 cell wide, so padding needs to be at least 1 cell in each direction.
-        // Use separate padding for horizontal and vertical to handle non-square cells.
-        let half_pad_w = cell_w; // 1 cell width for each side
-        let half_pad_h = cell_h; // 1 cell height for each side
+        let half_pad_w = cell_w;
+        let half_pad_h = cell_h;
 
-        // Parallel decode and resize (CPU-bound operations)
-        let tiles: Vec<_> = paths
+        // Prepare tile info and check cache
+        struct TileInfo {
+            path: PathBuf,
+            tile_x: u32,
+            tile_y: u32,
+            inner_w: u32,
+            inner_h: u32,
+        }
+
+        let mut cached_tiles: Vec<(u32, u32, Arc<RgbaImage>)> = Vec::new();
+        let mut uncached_tiles: Vec<TileInfo> = Vec::new();
+
+        for (i, path) in paths.iter().take(cols * rows).enumerate() {
+            let col = i % cols;
+            let row = i / cols;
+
+            let tile_x_cells = (col as u32 * canvas_w_cells) / cols as u32;
+            let tile_y_cells = (row as u32 * canvas_h_cells) / rows as u32;
+            let next_tile_x_cells = ((col + 1) as u32 * canvas_w_cells) / cols as u32;
+            let next_tile_y_cells = ((row + 1) as u32 * canvas_h_cells) / rows as u32;
+
+            let tile_x = tile_x_cells * cell_w;
+            let tile_y = tile_y_cells * cell_h;
+            let tile_w = (next_tile_x_cells - tile_x_cells) * cell_w;
+            let tile_h = (next_tile_y_cells - tile_y_cells) * cell_h;
+
+            let inner_w = tile_w.saturating_sub(half_pad_w * 2);
+            let inner_h = tile_h.saturating_sub(half_pad_h * 2);
+
+            if inner_w == 0 || inner_h == 0 {
+                continue;
+            }
+
+            let cache_key = (path.clone(), inner_w, inner_h);
+            if let Some(cached_thumb) = thumbnail_cache.get(&cache_key) {
+                // Cache hit: calculate position and add to cached_tiles
+                let scaled_w = cached_thumb.width();
+                let scaled_h = cached_thumb.height();
+                let img_x = tile_x + half_pad_w + (inner_w.saturating_sub(scaled_w)) / 2;
+                let img_y = tile_y + half_pad_h + (inner_h.saturating_sub(scaled_h)) / 2;
+                cached_tiles.push((img_x, img_y, cached_thumb));
+            } else {
+                // Cache miss: add to uncached_tiles for parallel processing
+                uncached_tiles.push(TileInfo {
+                    path: path.clone(),
+                    tile_x,
+                    tile_y,
+                    inner_w,
+                    inner_h,
+                });
+            }
+        }
+
+        // Parallel decode and resize for cache misses
+        let new_tiles: Vec<_> = uncached_tiles
             .par_iter()
-            .take(cols * rows)
-            .enumerate()
-            .filter_map(|(i, path)| {
-                let col = i % cols;
-                let row = i / cols;
-
-                // Calculate tile boundaries aligned to cell boundaries
-                let tile_x_cells = (col as u32 * canvas_w_cells) / cols as u32;
-                let tile_y_cells = (row as u32 * canvas_h_cells) / rows as u32;
-                let next_tile_x_cells = ((col + 1) as u32 * canvas_w_cells) / cols as u32;
-                let next_tile_y_cells = ((row + 1) as u32 * canvas_h_cells) / rows as u32;
-
-                // Convert to pixels
-                let tile_x = tile_x_cells * cell_w;
-                let tile_y = tile_y_cells * cell_h;
-                let tile_w = (next_tile_x_cells - tile_x_cells) * cell_w;
-                let tile_h = (next_tile_y_cells - tile_y_cells) * cell_h;
-
-                // Calculate inner size for this specific tile (with padding for cursor border)
-                let inner_w = tile_w.saturating_sub(half_pad_w * 2);
-                let inner_h = tile_h.saturating_sub(half_pad_h * 2);
-
-                if inner_w == 0 || inner_h == 0 {
-                    return None;
-                }
-
-                // Decode and resize image to fit tile (with padding)
-                let img = match Self::decode_image(path) {
+            .filter_map(|info| {
+                let img = match Self::decode_image(&info.path) {
                     Some(img) => img,
                     None => {
-                        // Log decode failure if tracing is enabled
                         if trace_worker {
                             use std::io::Write as _;
                             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -383,7 +462,7 @@ impl ImageWorker {
                                 .append(true)
                                 .open("/tmp/svt_worker.log")
                             {
-                                let _ = writeln!(f, "tile decode failed: {:?}", path);
+                                let _ = writeln!(f, "tile decode failed: {:?}", info.path);
                             }
                         }
                         return None;
@@ -391,32 +470,46 @@ impl ImageWorker {
                 };
                 let (orig_w, orig_h) = (img.width(), img.height());
 
-                // Calculate scaled size to fit within inner area while preserving aspect ratio
-                let scale_w = inner_w as f64 / orig_w as f64;
-                let scale_h = inner_h as f64 / orig_h as f64;
-                let scale = scale_w.min(scale_h).min(1.0); // Don't upscale
+                let scale_w = info.inner_w as f64 / orig_w as f64;
+                let scale_h = info.inner_h as f64 / orig_h as f64;
+                let scale = scale_w.min(scale_h).min(1.0);
 
                 let scaled_w = (orig_w as f64 * scale).floor().max(1.0) as u32;
                 let scaled_h = (orig_h as f64 * scale).floor().max(1.0) as u32;
 
                 let thumbnail = img.resize(scaled_w, scaled_h, filter);
-                let rgba_thumb = thumbnail.to_rgba8();
+                let rgba_thumb = Arc::new(thumbnail.to_rgba8());
 
-                // Calculate position to center image in tile cell (with padding)
-                let img_x = tile_x + half_pad_w + (inner_w.saturating_sub(scaled_w)) / 2;
-                let img_y = tile_y + half_pad_h + (inner_h.saturating_sub(scaled_h)) / 2;
+                let img_x =
+                    info.tile_x + half_pad_w + (info.inner_w.saturating_sub(scaled_w)) / 2;
+                let img_y =
+                    info.tile_y + half_pad_h + (info.inner_h.saturating_sub(scaled_h)) / 2;
 
-                Some((img_x, img_y, rgba_thumb))
+                Some((
+                    info.path.clone(),
+                    info.inner_w,
+                    info.inner_h,
+                    img_x,
+                    img_y,
+                    rgba_thumb,
+                ))
             })
             .collect();
 
-        // Sequential copy to canvas (GenericImage is not thread-safe)
+        // Add new thumbnails to cache
+        for (path, inner_w, inner_h, img_x, img_y, rgba_thumb) in new_tiles {
+            let cache_key = (path, inner_w, inner_h);
+            thumbnail_cache.insert(cache_key, Arc::clone(&rgba_thumb));
+            cached_tiles.push((img_x, img_y, rgba_thumb));
+        }
+
+        // Sequential copy to canvas
         let mut canvas = RgbaImage::from_pixel(canvas_w, canvas_h, Rgba([0, 0, 0, 0]));
-        for (img_x, img_y, rgba_thumb) in tiles {
+        for (img_x, img_y, rgba_thumb) in cached_tiles {
             let scaled_w = rgba_thumb.width();
             let scaled_h = rgba_thumb.height();
             if img_x + scaled_w <= canvas_w && img_y + scaled_h <= canvas_h {
-                let _ = canvas.copy_from(&rgba_thumb, img_x, img_y);
+                let _ = canvas.copy_from(&*rgba_thumb, img_x, img_y);
             }
         }
 
