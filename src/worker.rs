@@ -115,12 +115,12 @@ pub struct ImageWorker {
 }
 
 impl ImageWorker {
-    pub fn new() -> Self {
+    pub fn new(tile_threads: usize) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<ImageRequest>();
         let (result_tx, result_rx) = mpsc::channel::<ImageResult>();
 
         let handle = thread::spawn(move || {
-            Self::worker_loop(request_rx, result_tx);
+            Self::worker_loop(request_rx, result_tx, tile_threads);
         });
 
         Self {
@@ -140,10 +140,20 @@ impl ImageWorker {
         current
     }
 
-    fn worker_loop(request_rx: Receiver<ImageRequest>, result_tx: Sender<ImageResult>) {
+    fn worker_loop(
+        request_rx: Receiver<ImageRequest>,
+        result_tx: Sender<ImageResult>,
+        tile_threads: usize,
+    ) {
         let mut cache: Option<(PathBuf, Arc<DynamicImage>)> = None;
         let mut thumbnail_cache = ThumbnailCache::new(500); // Cache up to 500 thumbnails
         let mut pending: Option<ImageRequest> = None;
+
+        // Create dedicated thread pool for tile processing
+        let tile_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(tile_threads)
+            .build()
+            .expect("Failed to create tile thread pool");
 
         loop {
             // Get next request: from pending or wait for new one
@@ -173,6 +183,7 @@ impl ImageWorker {
                     Self::process_tile_request(
                         &req,
                         &mut thumbnail_cache,
+                        &tile_pool,
                         &mut pending,
                         &request_rx,
                         &result_tx,
@@ -300,6 +311,7 @@ impl ImageWorker {
     fn process_tile_request(
         req: &ImageRequest,
         thumbnail_cache: &mut ThumbnailCache,
+        tile_pool: &rayon::ThreadPool,
         pending: &mut Option<ImageRequest>,
         request_rx: &Receiver<ImageRequest>,
         result_tx: &Sender<ImageResult>,
@@ -319,6 +331,7 @@ impl ImageWorker {
             req.cell_size,
             req.tile_filter,
             thumbnail_cache,
+            tile_pool,
             req.trace_worker,
         ) else {
             return;
@@ -344,7 +357,7 @@ impl ImageWorker {
         });
     }
 
-    fn compute_target(orig: (u32, u32), max: (u32, u32), fit_mode: FitMode) -> (u32, u32) {
+    pub fn compute_target(orig: (u32, u32), max: (u32, u32), fit_mode: FitMode) -> (u32, u32) {
         let (orig_w, orig_h) = orig;
         let (max_w, max_h) = max;
 
@@ -376,12 +389,13 @@ impl ImageWorker {
         }
     }
 
-    fn decode_image(path: &std::path::Path) -> Option<DynamicImage> {
+    pub fn decode_image(path: &std::path::Path) -> Option<DynamicImage> {
         image::ImageReader::open(path).ok()?.decode().ok()
     }
 
     /// Composite multiple images into a single tile grid image (without cursor).
     /// Uses thumbnail cache and parallel processing for decode/resize operations.
+    #[allow(clippy::too_many_arguments)]
     fn composite_tile_images(
         paths: &[PathBuf],
         grid: (usize, usize),
@@ -389,6 +403,7 @@ impl ImageWorker {
         cell_size: Option<(u16, u16)>,
         filter: image::imageops::FilterType,
         thumbnail_cache: &mut ThumbnailCache,
+        tile_pool: &rayon::ThreadPool,
         trace_worker: bool,
     ) -> Option<(DynamicImage, (u32, u32))> {
         use image::{GenericImage, Rgba};
@@ -464,51 +479,55 @@ impl ImageWorker {
             }
         }
 
-        // Parallel decode and resize for cache misses
-        let new_tiles: Vec<_> = uncached_tiles
-            .par_iter()
-            .filter_map(|info| {
-                let img = match Self::decode_image(&info.path) {
-                    Some(img) => img,
-                    None => {
-                        if trace_worker {
-                            use std::io::Write as _;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("/tmp/svt_worker.log")
-                            {
-                                let _ = writeln!(f, "tile decode failed: {:?}", info.path);
+        // Parallel decode and resize for cache misses (using dedicated thread pool)
+        let new_tiles: Vec<_> = tile_pool.install(|| {
+            uncached_tiles
+                .par_iter()
+                .filter_map(|info| {
+                    let img = match Self::decode_image(&info.path) {
+                        Some(img) => img,
+                        None => {
+                            if trace_worker {
+                                use std::io::Write as _;
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("/tmp/svt_worker.log")
+                                {
+                                    let _ = writeln!(f, "tile decode failed: {:?}", info.path);
+                                }
                             }
+                            return None;
                         }
-                        return None;
-                    }
-                };
-                let (orig_w, orig_h) = (img.width(), img.height());
+                    };
+                    let (orig_w, orig_h) = (img.width(), img.height());
 
-                let scale_w = info.inner_w as f64 / orig_w as f64;
-                let scale_h = info.inner_h as f64 / orig_h as f64;
-                let scale = scale_w.min(scale_h).min(1.0);
+                    let scale_w = info.inner_w as f64 / orig_w as f64;
+                    let scale_h = info.inner_h as f64 / orig_h as f64;
+                    let scale = scale_w.min(scale_h).min(1.0);
 
-                let scaled_w = (orig_w as f64 * scale).floor().max(1.0) as u32;
-                let scaled_h = (orig_h as f64 * scale).floor().max(1.0) as u32;
+                    let scaled_w = (orig_w as f64 * scale).floor().max(1.0) as u32;
+                    let scaled_h = (orig_h as f64 * scale).floor().max(1.0) as u32;
 
-                let thumbnail = img.resize(scaled_w, scaled_h, filter);
-                let rgba_thumb = Arc::new(thumbnail.to_rgba8());
+                    let thumbnail = img.resize(scaled_w, scaled_h, filter);
+                    let rgba_thumb = Arc::new(thumbnail.to_rgba8());
 
-                let img_x = info.tile_x + half_pad_w + (info.inner_w.saturating_sub(scaled_w)) / 2;
-                let img_y = info.tile_y + half_pad_h + (info.inner_h.saturating_sub(scaled_h)) / 2;
+                    let img_x =
+                        info.tile_x + half_pad_w + (info.inner_w.saturating_sub(scaled_w)) / 2;
+                    let img_y =
+                        info.tile_y + half_pad_h + (info.inner_h.saturating_sub(scaled_h)) / 2;
 
-                Some((
-                    info.path.clone(),
-                    info.inner_w,
-                    info.inner_h,
-                    img_x,
-                    img_y,
-                    rgba_thumb,
-                ))
-            })
-            .collect();
+                    Some((
+                        info.path.clone(),
+                        info.inner_w,
+                        info.inner_h,
+                        img_x,
+                        img_y,
+                        rgba_thumb,
+                    ))
+                })
+                .collect()
+        });
 
         // Add new thumbnails to cache
         for (path, inner_w, inner_h, img_x, img_y, rgba_thumb) in new_tiles {
@@ -537,5 +556,60 @@ impl ImageWorker {
 
     pub fn try_recv(&self) -> Option<ImageResult> {
         self.result_rx.try_recv().ok()
+    }
+
+    /// Process a single image: decode → resize → encode.
+    /// Used by both ImageWorker and PrefetchWorker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_image(
+        path: &std::path::Path,
+        target: (u32, u32),
+        fit_mode: FitMode,
+        kgp_id: u32,
+        is_tmux: bool,
+        compress_level: Option<u32>,
+        tmux_kitty_max_pixels: u64,
+        resize_filter: image::imageops::FilterType,
+    ) -> Option<ImageResult> {
+        // Decode
+        let decoded = Self::decode_image(path)?;
+        let (orig_w, orig_h) = (decoded.width(), decoded.height());
+        let (max_w, max_h) = target;
+
+        // Compute target size
+        let (mut target_w, mut target_h) =
+            Self::compute_target((orig_w, orig_h), (max_w, max_h), fit_mode);
+
+        // Apply max pixels limit (for tmux+kitty compatibility)
+        if fit_mode != FitMode::Fit {
+            let max_pixels = tmux_kitty_max_pixels;
+            let target_pixels = (target_w as u64).saturating_mul(target_h as u64);
+            if target_pixels > max_pixels {
+                let down = (max_pixels as f64 / target_pixels as f64).sqrt();
+                target_w = (target_w as f64 * down).floor().max(1.0) as u32;
+                target_h = (target_h as f64 * down).floor().max(1.0) as u32;
+            }
+        }
+
+        // Resize
+        use std::borrow::Cow;
+        let resized: Cow<'_, DynamicImage> = if target_w != orig_w || target_h != orig_h {
+            Cow::Owned(decoded.resize(target_w, target_h, resize_filter))
+        } else {
+            Cow::Borrowed(&decoded)
+        };
+        let actual_size = (resized.width(), resized.height());
+
+        // Encode
+        let encoded_chunks = encode_chunks(&resized, kgp_id, is_tmux, compress_level);
+
+        Some(ImageResult {
+            path: path.to_path_buf(),
+            target,
+            fit_mode,
+            original_size: (orig_w, orig_h),
+            actual_size,
+            encoded_chunks: Arc::new(encoded_chunks),
+        })
     }
 }

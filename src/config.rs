@@ -27,6 +27,8 @@ pub struct Config {
     pub cell_aspect_ratio: f64,
     pub resize_filter: String,
     pub tile_filter: String,
+    pub prefetch_threads: usize,
+    pub tile_threads: usize,
 }
 
 impl Default for Config {
@@ -40,11 +42,13 @@ impl Default for Config {
             debug: false,
             kgp_no_compress: false,
             compress_level: 6,
-            tmux_kitty_max_pixels: 2_000_000,
+            tmux_kitty_max_pixels: 1_500_000,
             trace_worker: false,
             cell_aspect_ratio: 2.0,
             resize_filter: "triangle".to_string(),
             tile_filter: "nearest".to_string(),
+            prefetch_threads: 2,
+            tile_threads: 4,
         }
     }
 }
@@ -127,6 +131,12 @@ impl Config {
         if let Ok(v) = std::env::var("SVT_TILE_FILTER") {
             self.tile_filter = v;
         }
+        if let Some(v) = Self::parse_env::<usize>("SVT_PREFETCH_THREADS") {
+            self.prefetch_threads = v;
+        }
+        if let Some(v) = Self::parse_env::<usize>("SVT_TILE_THREADS") {
+            self.tile_threads = v;
+        }
     }
 
     fn clamp_values(&mut self) {
@@ -138,6 +148,8 @@ impl Config {
         self.render_cache_size = self.render_cache_size.clamp(1, MAX_RENDER_CACHE_SIZE);
         self.compress_level = self.compress_level.min(MAX_COMPRESS_LEVEL);
         self.cell_aspect_ratio = self.cell_aspect_ratio.clamp(1.0, 4.0);
+        self.prefetch_threads = self.prefetch_threads.clamp(1, 8);
+        self.tile_threads = self.tile_threads.clamp(1, 8);
     }
 
     fn parse_env<T: std::str::FromStr>(key: &str) -> Option<T> {
@@ -164,7 +176,7 @@ mod tests {
         assert_eq!(config.render_cache_size, 100);
         assert_eq!(config.prefetch_count, 5);
         assert_eq!(config.compress_level, 6);
-        assert_eq!(config.tmux_kitty_max_pixels, 2_000_000);
+        assert_eq!(config.tmux_kitty_max_pixels, 1_500_000);
         assert!(!config.force_alt_screen);
         assert!(!config.debug);
         assert_eq!(config.cell_aspect_ratio, 2.0);

@@ -15,6 +15,7 @@ mod app;
 mod config;
 mod fit;
 mod kgp;
+mod prefetch;
 mod sender;
 mod worker;
 
