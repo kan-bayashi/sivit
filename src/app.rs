@@ -718,19 +718,25 @@ impl App {
         self.config.prefetch_count
     }
 
-    /// Prefetch adjacent images (next and previous) into the render cache.
+    /// Prefetch adjacent images/pages into the render cache.
     /// Call this after the current image is fully displayed.
     pub fn prefetch_adjacent(&mut self, terminal_size: Rect) {
         // Skip if there's already a pending request (don't overwhelm the worker)
         if self.pending_request.is_some() {
             return;
         }
-
-        let prefetch_count = self.prefetch_count();
-        if prefetch_count == 0 {
+        if self.prefetch_count() == 0 {
             return;
         }
 
+        match self.view_mode {
+            ViewMode::Single => self.prefetch_adjacent_single(terminal_size),
+            ViewMode::Tile => self.prefetch_adjacent_tile(terminal_size),
+        }
+    }
+
+    /// Prefetch next/previous images in Single mode (with wrap-around).
+    fn prefetch_adjacent_single(&mut self, terminal_size: Rect) {
         let image_area = Self::image_area(terminal_size);
         let (cell_w, cell_h) = self.picker.font_size();
         if cell_w == 0 || cell_h == 0 || image_area.width == 0 || image_area.height == 0 {
@@ -741,25 +747,24 @@ impl App {
         let max_h_px = u32::from(image_area.height) * u32::from(cell_h);
         let target = (max_w_px, max_h_px);
 
-        // Try to prefetch next and previous images
         let len = self.images.len();
         if len <= 1 {
             return;
         }
 
-        // Build list of indices to prefetch: next N, then prev N
+        // Build list of indices: next images first, then previous images
+        let prefetch_count = self.prefetch_count();
         let mut indices = Vec::with_capacity(prefetch_count * 2);
         for i in 1..=prefetch_count {
-            indices.push((self.current_index + i) % len); // next
+            indices.push((self.current_index + i) % len);
         }
         for i in 1..=prefetch_count {
-            indices.push((self.current_index + len - i) % len); // prev
+            indices.push((self.current_index + len - i) % len);
         }
 
         for idx in indices {
             let path = &self.images[idx];
 
-            // Skip if already in cache
             let in_cache = self
                 .render_cache
                 .iter()
@@ -768,7 +773,6 @@ impl App {
                 continue;
             }
 
-            // Send prefetch request
             self.worker.request(ImageRequest {
                 path: path.clone(),
                 target,
@@ -783,7 +787,90 @@ impl App {
                 tile_grid: None,
                 cell_size: None,
             });
-            // Only prefetch one at a time to avoid overwhelming the worker
+            break;
+        }
+    }
+
+    /// Prefetch next/previous pages in Tile mode (no wrap-around).
+    fn prefetch_adjacent_tile(&mut self, terminal_size: Rect) {
+        let image_area = Self::image_area(terminal_size);
+        let (cell_w, cell_h) = self.picker.font_size();
+        if cell_w == 0 || cell_h == 0 || image_area.width == 0 || image_area.height == 0 {
+            return;
+        }
+
+        let max_w_px = u32::from(image_area.width) * u32::from(cell_w);
+        let max_h_px = u32::from(image_area.height) * u32::from(cell_h);
+        let target = (max_w_px, max_h_px);
+
+        let grid = Self::calculate_tile_grid(terminal_size, self.config.cell_aspect_ratio);
+        let (cols, rows) = grid;
+        let tiles_per_page = cols * rows;
+        if tiles_per_page == 0 {
+            return;
+        }
+
+        let len = self.images.len();
+        let total_pages = len.div_ceil(tiles_per_page);
+        if total_pages <= 1 {
+            return;
+        }
+
+        let current_page = self.tile_cursor / tiles_per_page;
+        let prefetch_count = self.prefetch_count();
+
+        // Build list of page indices: next pages first, then previous pages
+        let mut page_indices = Vec::with_capacity(prefetch_count * 2);
+        for i in 1..=prefetch_count {
+            let next_page = current_page + i;
+            if next_page < total_pages {
+                page_indices.push(next_page);
+            }
+        }
+        for i in 1..=prefetch_count {
+            if current_page >= i {
+                page_indices.push(current_page - i);
+            }
+        }
+
+        for page in page_indices {
+            let page_start = page * tiles_per_page;
+            let cache_key = PathBuf::from(format!("__tile_page_{}", page_start));
+
+            let in_cache = self
+                .render_cache
+                .iter()
+                .any(|r| r.path == cache_key && r.target == target && r.fit_mode == self.fit_mode);
+            if in_cache {
+                continue;
+            }
+
+            let tile_paths: Vec<PathBuf> = self
+                .images
+                .iter()
+                .skip(page_start)
+                .take(tiles_per_page)
+                .cloned()
+                .collect();
+
+            if tile_paths.is_empty() {
+                continue;
+            }
+
+            self.worker.request(ImageRequest {
+                path: cache_key,
+                target,
+                fit_mode: self.fit_mode,
+                kgp_id: self.kgp_id,
+                is_tmux: self.is_tmux,
+                compress_level: self.config.compression_level(),
+                tmux_kitty_max_pixels: self.config.tmux_kitty_max_pixels,
+                trace_worker: self.config.trace_worker,
+                view_mode: ViewMode::Tile,
+                tile_paths: Some(tile_paths),
+                tile_grid: Some(grid),
+                cell_size: Some((cell_w, cell_h)),
+            });
             break;
         }
     }

@@ -406,12 +406,13 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
         // Transmits only after user stops navigating (debounce via nav_latch).
         app.prepare_render_request(terminal_rect, allow_transmission);
 
-        // Prefetch adjacent images after current image is fully displayed.
-        // Note: Prefetch only in Single mode (Ready or Fit states).
+        // Prefetch adjacent images/pages after current image is fully displayed.
         if allow_transmission
             && matches!(
                 indicator,
-                crate::sender::StatusIndicator::Ready | crate::sender::StatusIndicator::Fit
+                crate::sender::StatusIndicator::Ready
+                    | crate::sender::StatusIndicator::Fit
+                    | crate::sender::StatusIndicator::Tile
             )
         {
             app.prefetch_adjacent(terminal_rect);
