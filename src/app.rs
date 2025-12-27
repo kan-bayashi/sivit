@@ -517,6 +517,44 @@ impl App {
         });
     }
 
+    /// Copy the current image's absolute path to clipboard via OSC 52.
+    pub fn copy_path_to_clipboard(&self) -> bool {
+        let Some(path) = self.current_path() else {
+            return false;
+        };
+        let Some(path_str) = path.to_str() else {
+            return false;
+        };
+        self.writer.send(WriterRequest::CopyToClipboard {
+            data: path_str.as_bytes().to_vec(),
+            is_tmux: self.is_tmux,
+        });
+        true
+    }
+
+    /// Copy the current image data to clipboard (local only, uses OS API).
+    pub fn copy_image_to_clipboard(&self) -> bool {
+        use arboard::{Clipboard, ImageData};
+
+        let Some(path) = self.current_path() else {
+            return false;
+        };
+        let Ok(img) = image::open(path) else {
+            return false;
+        };
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let image_data = ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: rgba.into_raw().into(),
+        };
+        let Ok(mut clipboard) = Clipboard::new() else {
+            return false;
+        };
+        clipboard.set_image(image_data).is_ok()
+    }
+
     pub fn current_image_name(&self) -> String {
         self.images
             .get(self.current_index)

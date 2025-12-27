@@ -108,6 +108,9 @@ fn main() -> Result<()> {
     result
 }
 
+/// Duration to show temporary status messages (e.g., "Copied to clipboard").
+const TEMP_STATUS_DURATION: Duration = Duration::from_millis(1500);
+
 fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
     use std::time::Instant;
 
@@ -118,6 +121,7 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
     let mut last_status = String::new();
     let mut last_size: (u16, u16) = (0, 0);
     let mut last_indicator = crate::sender::StatusIndicator::Busy;
+    let mut temp_status_until: Option<Instant> = None;
 
     loop {
         // Poll worker for completed renders
@@ -191,6 +195,40 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
                         app.reload();
                         did_nav = true;
                     }
+                    KeyCode::Char('y') => {
+                        let (w, h) = terminal::size().unwrap_or((80, 24));
+                        if app.copy_path_to_clipboard() {
+                            app.send_status(
+                                "Copied path to clipboard".to_string(),
+                                (w, h),
+                                crate::sender::StatusIndicator::Ready,
+                            );
+                        } else {
+                            app.send_status(
+                                "Failed to copy path".to_string(),
+                                (w, h),
+                                crate::sender::StatusIndicator::Busy,
+                            );
+                        }
+                        temp_status_until = Some(Instant::now() + TEMP_STATUS_DURATION);
+                    }
+                    KeyCode::Char('Y') => {
+                        let (w, h) = terminal::size().unwrap_or((80, 24));
+                        if app.copy_image_to_clipboard() {
+                            app.send_status(
+                                "Copied image to clipboard".to_string(),
+                                (w, h),
+                                crate::sender::StatusIndicator::Ready,
+                            );
+                        } else {
+                            app.send_status(
+                                "Failed to copy image".to_string(),
+                                (w, h),
+                                crate::sender::StatusIndicator::Busy,
+                            );
+                        }
+                        temp_status_until = Some(Instant::now() + TEMP_STATUS_DURATION);
+                    }
                     _ => {}
                 }
 
@@ -223,12 +261,18 @@ fn run(images: Vec<PathBuf>, config: Config) -> Result<()> {
         let (w, h) = terminal::size()?;
         let terminal_rect = Rect::new(0, 0, w, h);
 
+        // Clear temporary status after timeout.
+        if temp_status_until.is_some_and(|t| Instant::now() >= t) {
+            temp_status_until = None;
+            last_status.clear(); // Force redraw with normal status.
+        }
+
         // Update status bar only when it changes (or on resize).
         let status_now = app.status_text();
         let indicator = app.status_indicator(terminal_rect, allow_transmission);
         let should_draw =
             status_now != last_status || (w, h) != last_size || indicator != last_indicator;
-        if should_draw {
+        if should_draw && temp_status_until.is_none() {
             app.send_status(status_now.clone(), (w, h), indicator);
             last_status = status_now;
             last_size = (w, h);

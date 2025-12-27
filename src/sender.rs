@@ -52,6 +52,11 @@ pub enum WriterRequest {
         area: Option<Rect>,
         epoch: u64,
     },
+    /// Copy data to clipboard via OSC 52.
+    CopyToClipboard {
+        data: Vec<u8>,
+        is_tmux: bool,
+    },
     Shutdown,
 }
 
@@ -267,6 +272,13 @@ impl TerminalWriter {
                     epoch,
                     is_tmux,
                 ));
+            }
+            WriterRequest::CopyToClipboard { data, is_tmux } => {
+                if is_tty {
+                    let osc52 = build_osc52_clipboard(&data, is_tmux);
+                    let _ = out.write_all(&osc52);
+                    let _ = out.flush();
+                }
             }
         }
     }
@@ -509,6 +521,17 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
     Rect::new(x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16)
 }
 
+/// Build OSC 52 escape sequence for clipboard copy.
+fn build_osc52_clipboard(data: &[u8], is_tmux: bool) -> Vec<u8> {
+    let b64 = base64_simd::STANDARD.encode_to_string(data);
+
+    if is_tmux {
+        format!("\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\").into_bytes()
+    } else {
+        format!("\x1b]52;c;{b64}\x07").into_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +681,24 @@ mod tests {
         // 7 bytes: can fit 2 chars (6 bytes), not 3rd partial
         let clipped = clip_utf8(s, 7);
         assert_eq!(clipped, "日本");
+    }
+
+    #[test]
+    fn test_build_osc52_clipboard() {
+        let data = b"test";
+        let result = build_osc52_clipboard(data, false);
+        let s = String::from_utf8_lossy(&result);
+        assert!(s.starts_with("\x1b]52;c;"));
+        assert!(s.ends_with("\x07"));
+        assert!(s.contains("dGVzdA==")); // base64 of "test"
+    }
+
+    #[test]
+    fn test_build_osc52_clipboard_tmux() {
+        let data = b"test";
+        let result = build_osc52_clipboard(data, true);
+        let s = String::from_utf8_lossy(&result);
+        assert!(s.starts_with("\x1bPtmux;"));
+        assert!(s.ends_with("\x1b\\"));
     }
 }

@@ -10,6 +10,7 @@ A minimal & fast terminal image viewer written in Rust with sxiv-like keybinding
 
 - **Fast** - Zlib compression, prefetch, and render cache for instant navigation
 - **Keyboard-driven** - sxiv/vim-like keybindings with count support
+- **Clipboard** - Copy path (OSC 52, works over SSH) or image to clipboard (local/X11 only)
 - **Flexible** - Fit/Normal display modes, works over SSH with Tmux
 - **KGP** - Kitty Graphics Protocol for high-quality image rendering
 
@@ -66,6 +67,8 @@ svt ~/photos/*.jpg
 | `G` | Last image |
 | `f` | Toggle fit |
 | `r` | Reload (clear cache) |
+| `y` | Copy path to clipboard (OSC 52, works over SSH) |
+| `Y` | Copy image to clipboard (local/X11 only) |
 | `q` | Quit |
 
 Vim-like counts are supported (e.g. `5j`, `10G`).

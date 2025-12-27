@@ -118,3 +118,27 @@ These invariants must be preserved when modifying the codebase:
 5. **Transmit must complete once started**
    - Skip cancellation during active transmission (`is_transmitting()`)
    - Ensures terminal receives complete image data
+
+## Clipboard Support
+
+`svt` provides two clipboard copy methods via `y` and `Y` keys:
+
+### Path Copy (`y` key)
+
+Uses **OSC 52** escape sequence to copy the image path as text:
+
+- Format: `\x1b]52;c;<base64>\x07`
+- Works over SSH (terminal interprets the sequence locally)
+- Tmux-aware: wraps in `\x1bPtmux;...\x1b\\` when `$TMUX` is set
+
+Implementation: `WriterRequest::CopyToClipboard` in `src/sender.rs`
+
+### Image Copy (`Y` key)
+
+Uses **arboard** crate to copy image data via OS clipboard API:
+
+- Converts image to RGBA and sends to system clipboard
+- Works on local machine and X11-forwarded SSH sessions
+- Does NOT work on headless SSH (no display server)
+
+Implementation: `copy_image_to_clipboard()` in `src/app.rs`
