@@ -21,8 +21,18 @@ use image::{DynamicImage, RgbaImage};
 use crate::fit::{FitMode, ViewMode};
 use crate::kgp::encode_chunks;
 
-/// Cache key for tile thumbnails: (path, width, height)
-type ThumbnailKey = (PathBuf, u32, u32);
+/// Cache key for tile thumbnails: (path, width, height, filter)
+type ThumbnailKey = (PathBuf, u32, u32, u8);
+
+fn filter_cache_id(filter: image::imageops::FilterType) -> u8 {
+    match filter {
+        image::imageops::FilterType::Nearest => 0,
+        image::imageops::FilterType::Triangle => 1,
+        image::imageops::FilterType::CatmullRom => 2,
+        image::imageops::FilterType::Gaussian => 3,
+        image::imageops::FilterType::Lanczos3 => 4,
+    }
+}
 
 /// LRU cache for tile thumbnails
 struct ThumbnailCache {
@@ -34,27 +44,32 @@ struct ThumbnailCache {
 impl ThumbnailCache {
     fn new(capacity: usize) -> Self {
         Self {
-            cache: HashMap::new(),
-            order: VecDeque::new(),
+            cache: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
             capacity,
         }
     }
 
     fn get(&mut self, key: &ThumbnailKey) -> Option<Arc<RgbaImage>> {
-        if let Some(img) = self.cache.get(key) {
+        let img = self.cache.get(key)?;
+        if !matches!(self.order.back(), Some(k) if k == key) {
             // Move to back (most recently used)
             self.order.retain(|k| k != key);
             self.order.push_back(key.clone());
-            Some(Arc::clone(img))
-        } else {
-            None
         }
+        Some(Arc::clone(img))
     }
 
     fn insert(&mut self, key: ThumbnailKey, img: Arc<RgbaImage>) {
         if self.cache.contains_key(&key) {
-            self.order.retain(|k| k != &key);
-        } else if self.cache.len() >= self.capacity {
+            if !matches!(self.order.back(), Some(k) if k == &key) {
+                self.order.retain(|k| k != &key);
+                self.order.push_back(key.clone());
+            }
+            self.cache.insert(key, img);
+            return;
+        }
+        if self.cache.len() >= self.capacity {
             // Evict oldest
             if let Some(oldest) = self.order.pop_front() {
                 self.cache.remove(&oldest);
@@ -404,6 +419,7 @@ impl ImageWorker {
             inner_h: u32,
         }
 
+        let filter_id = filter_cache_id(filter);
         let mut cached_tiles: Vec<(u32, u32, Arc<RgbaImage>)> = Vec::new();
         let mut uncached_tiles: Vec<TileInfo> = Vec::new();
 
@@ -428,7 +444,7 @@ impl ImageWorker {
                 continue;
             }
 
-            let cache_key = (path.clone(), inner_w, inner_h);
+            let cache_key = (path.clone(), inner_w, inner_h, filter_id);
             if let Some(cached_thumb) = thumbnail_cache.get(&cache_key) {
                 // Cache hit: calculate position and add to cached_tiles
                 let scaled_w = cached_thumb.width();
@@ -496,7 +512,7 @@ impl ImageWorker {
 
         // Add new thumbnails to cache
         for (path, inner_w, inner_h, img_x, img_y, rgba_thumb) in new_tiles {
-            let cache_key = (path, inner_w, inner_h);
+            let cache_key = (path, inner_w, inner_h, filter_id);
             thumbnail_cache.insert(cache_key, Arc::clone(&rgba_thumb));
             cached_tiles.push((img_x, img_y, rgba_thumb));
         }

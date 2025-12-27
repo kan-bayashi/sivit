@@ -368,6 +368,17 @@ impl App {
         }
     }
 
+    fn touch_render_cache(&mut self, key: &CacheKey) {
+        if matches!(self.render_cache_order.back(), Some(k) if k == key) {
+            return;
+        }
+        if !self.render_cache.contains_key(key) {
+            return;
+        }
+        self.render_cache_order.retain(|k| k != key);
+        self.render_cache_order.push_back(key.clone());
+    }
+
     pub fn poll_writer(&mut self) {
         while let Some(result) = self.writer.try_recv() {
             if result.epoch != self.render_epoch {
@@ -532,9 +543,12 @@ impl App {
 
         // Check if we have a cached rendered result
         let key = (path.clone(), target, self.fit_mode);
-        if let Some(rendered) = self.render_cache.get(&key) {
-            let (actual_size, encoded_chunks) =
-                (rendered.actual_size, rendered.encoded_chunks.clone());
+        if let Some((actual_size, encoded_chunks)) = self
+            .render_cache
+            .get(&key)
+            .map(|rendered| (rendered.actual_size, Arc::clone(&rendered.encoded_chunks)))
+        {
+            self.touch_render_cache(&key);
 
             // Calculate area for placement based on actual image size
             let cells_w = actual_size.0.div_ceil(u32::from(cell_w));
@@ -586,6 +600,8 @@ impl App {
         }
 
         // Request from worker if not already pending
+        let resize_filter = crate::config::parse_filter_type(&self.config.resize_filter);
+        let tile_filter = crate::config::parse_filter_type(&self.config.tile_filter);
         let pending_key = (path, target, self.fit_mode);
         if self.pending_request.as_ref() != Some(&pending_key) {
             self.worker.request(ImageRequest {
@@ -597,12 +613,12 @@ impl App {
                 compress_level: self.config.compression_level(),
                 tmux_kitty_max_pixels: self.config.tmux_kitty_max_pixels,
                 trace_worker: self.config.trace_worker,
-                resize_filter: crate::config::parse_filter_type(&self.config.resize_filter),
+                resize_filter,
                 view_mode: ViewMode::Single,
                 tile_paths: None,
                 tile_grid: None,
                 cell_size: None,
-                tile_filter: crate::config::parse_filter_type(&self.config.tile_filter),
+                tile_filter,
             });
             self.pending_request = Some(pending_key);
         }
@@ -645,9 +661,12 @@ impl App {
         let key = (cache_path.clone(), target, self.fit_mode);
 
         // Check cache
-        if let Some(rendered) = self.render_cache.get(&key) {
-            let (actual_size, encoded_chunks) =
-                (rendered.actual_size, rendered.encoded_chunks.clone());
+        if let Some((actual_size, encoded_chunks)) = self
+            .render_cache
+            .get(&key)
+            .map(|rendered| (rendered.actual_size, Arc::clone(&rendered.encoded_chunks)))
+        {
+            self.touch_render_cache(&key);
 
             let cells_w = actual_size.0.div_ceil(u32::from(cell_w));
             let cells_h = actual_size.1.div_ceil(u32::from(cell_h));
@@ -689,6 +708,8 @@ impl App {
         }
 
         // Request tile composite from worker (cursor is drawn via ANSI overlay)
+        let resize_filter = crate::config::parse_filter_type(&self.config.resize_filter);
+        let tile_filter = crate::config::parse_filter_type(&self.config.tile_filter);
         if self.pending_request.as_ref() != Some(&key) {
             self.worker.request(ImageRequest {
                 path: cache_path,
@@ -699,12 +720,12 @@ impl App {
                 compress_level: self.config.compression_level(),
                 tmux_kitty_max_pixels: self.config.tmux_kitty_max_pixels,
                 trace_worker: self.config.trace_worker,
-                resize_filter: crate::config::parse_filter_type(&self.config.resize_filter),
+                resize_filter,
                 view_mode: ViewMode::Tile,
                 tile_paths: Some(tile_paths),
                 tile_grid: Some(grid),
                 cell_size: Some((cell_w, cell_h)),
-                tile_filter: crate::config::parse_filter_type(&self.config.tile_filter),
+                tile_filter,
             });
             self.pending_request = Some(key);
         }
@@ -766,6 +787,8 @@ impl App {
                 continue;
             }
 
+            let resize_filter = crate::config::parse_filter_type(&self.config.resize_filter);
+            let tile_filter = crate::config::parse_filter_type(&self.config.tile_filter);
             self.worker.request(ImageRequest {
                 path: path.clone(),
                 target,
@@ -775,12 +798,12 @@ impl App {
                 compress_level: self.config.compression_level(),
                 tmux_kitty_max_pixels: self.config.tmux_kitty_max_pixels,
                 trace_worker: self.config.trace_worker,
-                resize_filter: crate::config::parse_filter_type(&self.config.resize_filter),
+                resize_filter,
                 view_mode: ViewMode::Single,
                 tile_paths: None,
                 tile_grid: None,
                 cell_size: None,
-                tile_filter: crate::config::parse_filter_type(&self.config.tile_filter),
+                tile_filter,
             });
             break;
         }
@@ -849,6 +872,8 @@ impl App {
                 continue;
             }
 
+            let resize_filter = crate::config::parse_filter_type(&self.config.resize_filter);
+            let tile_filter = crate::config::parse_filter_type(&self.config.tile_filter);
             self.worker.request(ImageRequest {
                 path: cache_path,
                 target,
@@ -858,12 +883,12 @@ impl App {
                 compress_level: self.config.compression_level(),
                 tmux_kitty_max_pixels: self.config.tmux_kitty_max_pixels,
                 trace_worker: self.config.trace_worker,
-                resize_filter: crate::config::parse_filter_type(&self.config.resize_filter),
+                resize_filter,
                 view_mode: ViewMode::Tile,
                 tile_paths: Some(tile_paths),
                 tile_grid: Some(grid),
                 cell_size: Some((cell_w, cell_h)),
-                tile_filter: crate::config::parse_filter_type(&self.config.tile_filter),
+                tile_filter,
             });
             break;
         }
@@ -930,7 +955,7 @@ impl App {
     /// Get the original resolution of the current image from cache.
     fn current_image_resolution(&self) -> Option<(u32, u32)> {
         let path = self.current_path()?;
-        // Search by path prefix in cache keys
+        // Search by path in cache keys
         self.render_cache
             .iter()
             .find(|(k, _)| &k.0 == path)

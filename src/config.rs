@@ -52,13 +52,19 @@ impl Default for Config {
 /// Parse filter type string to image::imageops::FilterType.
 /// Returns Triangle as fallback for invalid values.
 pub fn parse_filter_type(s: &str) -> image::imageops::FilterType {
-    match s.to_lowercase().as_str() {
-        "nearest" => image::imageops::FilterType::Nearest,
-        "triangle" => image::imageops::FilterType::Triangle,
-        "catmullrom" | "catmull-rom" => image::imageops::FilterType::CatmullRom,
-        "gaussian" => image::imageops::FilterType::Gaussian,
-        "lanczos3" | "lanczos" => image::imageops::FilterType::Lanczos3,
-        _ => image::imageops::FilterType::Triangle,
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("nearest") {
+        image::imageops::FilterType::Nearest
+    } else if s.eq_ignore_ascii_case("triangle") {
+        image::imageops::FilterType::Triangle
+    } else if s.eq_ignore_ascii_case("catmullrom") || s.eq_ignore_ascii_case("catmull-rom") {
+        image::imageops::FilterType::CatmullRom
+    } else if s.eq_ignore_ascii_case("gaussian") {
+        image::imageops::FilterType::Gaussian
+    } else if s.eq_ignore_ascii_case("lanczos3") || s.eq_ignore_ascii_case("lanczos") {
+        image::imageops::FilterType::Lanczos3
+    } else {
+        image::imageops::FilterType::Triangle
     }
 }
 
